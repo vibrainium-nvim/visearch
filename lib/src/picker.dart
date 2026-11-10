@@ -59,10 +59,10 @@ class PickerGeometry {
     final safeEditorW = editorWidth.clamp(40, 1000);
     final safeEditorH = editorHeight.clamp(12, 500);
 
-    final totalW = (safeEditorW * widthRatio.clamp(0.50, 0.98))
+    final totalW = (safeEditorW * widthRatio.clamp(0.50, 1.0))
         .round()
         .clamp(38, safeEditorW - 2);
-    final totalH = (safeEditorH * heightRatio.clamp(0.45, 0.96))
+    final totalH = (safeEditorH * heightRatio.clamp(0.45, 1.0))
         .round()
         .clamp(8, safeEditorH - 2);
 
@@ -145,6 +145,8 @@ class VisearchPicker {
   int? _nsId;
   bool _highlightsInitialized = false;
 
+  int? _paddingBuf;
+  int? _paddingWin;
   int? _promptBuf;
   int? _promptWin;
   int? _resultsBuf;
@@ -156,6 +158,35 @@ class VisearchPicker {
   int? _originBuf;
   String? _originBufPath;
   List<String>? _originBufLines;
+  String? _lastConfirmedFilePath;
+  int? _lastActiveEditorWin;
+  int? _lastSeenAlternateWin;
+  Set<int> _excludedWindows = const {};
+  DateTime? _lastClickTime;
+  int? _lastClickRow;
+  DateTime? _lastDoubleClickTime;
+
+  static const Set<String> _nonEditorFiletypes = {
+    'viworkspace',
+    'viff',
+    'viff-picker',
+    'viff-menu',
+    'vivcs',
+    'vivcs-picker',
+    'vivcs-menu',
+    'viproblems',
+    'viproblems-detail',
+    'vibrainium-tabbar',
+    'vibrainium-bottom-tabbar',
+    'viworkspace-prompt',
+    'viworkspace-confirm',
+    'viworkspace-menu',
+    'visearch-padding',
+    'visearch-prompt',
+    'visearch-results',
+    'visearch-preview',
+    'visearch-dropdown',
+  };
 
   String _workspaceRoot = '';
   VibrainiumSettings _settings = const VibrainiumSettings();
@@ -170,8 +201,8 @@ class VisearchPicker {
   int _selectedIndex = 0;
   int _searchGeneration = 0;
 
-  double _widthRatio = 0.84;
-  double _heightRatio = 0.80;
+  double _widthRatio = 1.0;
+  double _heightRatio = 1.0;
   double _splitRatio = 0.48;
   bool _showPreview = true;
   PickerGeometry? _lastGeometry;
@@ -207,17 +238,37 @@ class VisearchPicker {
   double get heightRatio => _heightRatio;
   double get splitRatio => _splitRatio;
   bool get showPreview => _showPreview;
+  int? get paddingWindowId => _paddingWin;
   int? get promptWindowId => _promptWin;
   int? get resultsWindowId => _resultsWin;
   int? get previewWindowId => _previewWin;
+  int? get lastActiveEditorWin => _lastActiveEditorWin;
+  String? get lastConfirmedFilePath => _lastConfirmedFilePath;
   DropdownMenu<SearchTarget> get targetDropdown => _targetDropdown;
   DropdownMenu<Object> get scopeDropdown => _scopeDropdown;
   GlobInputPrompt get globPrompt => _globPrompt;
 
+  void attachWindow({
+    Set<int> excludedWins = const {},
+    int? lastActiveEditorWin,
+  }) {
+    _excludedWindows = excludedWins;
+    if (lastActiveEditorWin != null && lastActiveEditorWin > 0) {
+      if (_lastActiveEditorWin != lastActiveEditorWin) {
+        _lastSeenAlternateWin = null;
+      }
+      _lastActiveEditorWin = lastActiveEditorWin;
+    }
+  }
+
   Future<bool> isOpen() async {
     final win = _promptWin;
     if (win == null) return false;
-    return nvim.winIsValid(win);
+    try {
+      return await nvim.winIsValid(win);
+    } catch (_) {
+      return false;
+    }
   }
 
   /// Opens the unified picker in [initialTarget] mode (`files`, `text`, or `symbols`).
@@ -225,6 +276,10 @@ class VisearchPicker {
     SearchTarget initialTarget = SearchTarget.files,
     SearchScope? initialScope,
   }) async {
+    _lastConfirmedFilePath = null;
+    _lastClickTime = null;
+    _lastClickRow = null;
+    _lastDoubleClickTime = null;
     final alreadyOpen = await isOpen();
     if (!alreadyOpen) {
       await _captureOriginContext();
@@ -252,6 +307,22 @@ class VisearchPicker {
 
   /// Closes the picker and any open dropdowns/prompts.
   Future<void> close() async {
+    _searchGeneration++;
+    final winsToClose = <int?>[
+      _paddingWin,
+      _previewWin,
+      _resultsWin,
+      _promptWin,
+    ];
+    _paddingWin = null;
+    _promptWin = null;
+    _resultsWin = null;
+    _previewWin = null;
+    _paddingBuf = null;
+    _promptBuf = null;
+    _resultsBuf = null;
+    _previewBuf = null;
+
     await _targetDropdown.close();
     await _scopeDropdown.close();
     await _globPrompt.close();
@@ -262,8 +333,9 @@ class VisearchPicker {
       );
     } catch (_) {}
 
-    for (final win in [_previewWin, _resultsWin, _promptWin]) {
-      if (win != null) {
+    final closedWins = <int>{};
+    for (final win in winsToClose) {
+      if (win != null && closedWins.add(win)) {
         try {
           if (await nvim.winIsValid(win)) {
             await nvim.winClose(win, force: true);
@@ -271,12 +343,24 @@ class VisearchPicker {
         } catch (_) {}
       }
     }
-    _promptWin = null;
-    _resultsWin = null;
-    _previewWin = null;
-    _promptBuf = null;
-    _resultsBuf = null;
-    _previewBuf = null;
+
+    try {
+      final remainingWins = await nvim.listWins();
+      for (final win in remainingWins) {
+        if (closedWins.contains(win)) continue;
+        try {
+          final buf = await nvim.winGetBuf(win);
+          if (buf <= 0) continue;
+          final ft = (await nvim.bufGetOption(buf, 'filetype'))?.toString() ?? '';
+          if (ft == 'visearch-padding' ||
+              ft == 'visearch-prompt' ||
+              ft == 'visearch-results' ||
+              ft == 'visearch-preview') {
+            await nvim.winClose(win, force: true);
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
 
     final origWin = _originWin;
     if (origWin != null) {
@@ -321,6 +405,9 @@ class VisearchPicker {
         return true;
       case 'search.confirm':
         await confirmSelection();
+        return true;
+      case 'search.copy_path':
+        await copySelectedPath();
         return true;
       case 'search.target_next':
         await cycleTarget(1);
@@ -379,12 +466,29 @@ class VisearchPicker {
       case 'search.results_double_click':
         await handleResultsClick(openFile: true);
         return true;
+      case 'search.focus_prompt_normal':
+        await _targetDropdown.close();
+        await _scopeDropdown.close();
+        await _focusPrompt(startInsert: false);
+        return true;
     }
     return false;
   }
 
   Future<void> onHotReloaded() async {
     _highlightsInitialized = false;
+    final pBuf = _promptBuf;
+    if (pBuf != null && await nvim.bufIsValid(pBuf)) {
+      await _bindPromptKeys(pBuf);
+    }
+    final rBuf = _resultsBuf;
+    if (rBuf != null && await nvim.bufIsValid(rBuf)) {
+      await _bindResultsKeys(rBuf);
+    }
+    final prevBuf = _previewBuf;
+    if (prevBuf != null && await nvim.bufIsValid(prevBuf)) {
+      await _bindPreviewKeys(prevBuf);
+    }
     if (await isOpen()) {
       await _ensureHighlights();
       await relayout();
@@ -468,6 +572,12 @@ class VisearchPicker {
   /// Opens the Target mode dropdown (`Files`, `Text`, `Symbols`).
   Future<void> openTargetDropdown() async {
     if (!await isOpen()) return;
+    if (_targetDropdown.isOpen) {
+      await _targetDropdown.cancel();
+      return;
+    }
+    await _scopeDropdown.close();
+    await _globPrompt.close();
     final geom = _lastGeometry ?? await _computeCurrentGeometry();
     final items = SearchTarget.values
         .map(
@@ -502,6 +612,12 @@ class VisearchPicker {
   /// recent custom globs, and `Custom Path/Glob…`).
   Future<void> openScopeDropdown() async {
     if (!await isOpen()) return;
+    if (_scopeDropdown.isOpen) {
+      await _scopeDropdown.cancel();
+      return;
+    }
+    await _targetDropdown.close();
+    await _globPrompt.close();
     final geom = _lastGeometry ?? await _computeCurrentGeometry();
 
     final wsScope = const SearchScope.workspace();
@@ -593,13 +709,38 @@ class VisearchPicker {
 
   /// Opens the currently selected item in the origin window and jumps to `(line, col)`.
   Future<void> confirmSelection() async {
+    final liveQuery = await _readPromptQuery();
+    if (liveQuery.isNotEmpty && liveQuery != _query) {
+      _query = liveQuery;
+      _selectedIndex = 0;
+      final (found, totalScoped) = await _executeSearchProvider();
+      _items = found;
+      _totalScopedCount = totalScoped;
+    }
     if (_items.isEmpty) {
       await close();
       return;
     }
     final idx = _selectedIndex.clamp(0, _items.length - 1);
     final item = _items[idx];
+    _lastConfirmedFilePath = item.filePath;
     await close();
+
+    int? targetWin = await _resolveTargetEditorWin();
+    if (targetWin != null) {
+      _lastActiveEditorWin = targetWin;
+      await nvim.setCurrentWin(targetWin);
+    } else {
+      await nvim.command('botright vsplit');
+      final newWin = await nvim.getCurrentWin();
+      if (newWin > 0) {
+        _lastActiveEditorWin = newWin;
+        await nvim.winSetOption(newWin, 'winfixwidth', false);
+        await nvim.winSetOption(newWin, 'winfixheight', false);
+        await nvim.winSetOption(newWin, 'number', true);
+        await nvim.winSetOption(newWin, 'signcolumn', 'auto');
+      }
+    }
 
     final escaped = item.filePath.replaceAll(' ', r'\ ');
     await nvim.command('edit $escaped');
@@ -610,11 +751,25 @@ class VisearchPicker {
     } catch (_) {}
   }
 
+  /// Copies the currently selected item's workspace-relative path to the clipboard.
+  Future<void> copySelectedPath() async {
+    if (_items.isEmpty) return;
+    final idx = _selectedIndex.clamp(0, _items.length - 1);
+    final item = _items[idx];
+    await nvim.copyToClipboard(item.relativePath);
+    await nvim.notify('Copied path: ${item.relativePath}');
+  }
+
   /// Recomputes and applies floating window geometry (e.g. on `VimResized` or mouse drag).
   Future<void> relayout() async {
     if (!await isOpen()) return;
     final geom = await _computeCurrentGeometry();
     _lastGeometry = geom;
+
+    final padWin = _paddingWin;
+    if (padWin != null && await nvim.winIsValid(padWin)) {
+      await nvim.winSetConfig(padWin, _paddingWinConfig(geom));
+    }
 
     final pWin = _promptWin;
     if (pWin != null && await nvim.winIsValid(pWin)) {
@@ -687,14 +842,14 @@ class VisearchPicker {
     var changed = false;
     if (screenCol <= geom.outerCol + 2 ||
         screenCol >= geom.outerCol + geom.totalWidth - 2) {
-      final nextW = (halfSpanW / geom.editorWidth).clamp(0.50, 0.98);
+      final nextW = (halfSpanW / geom.editorWidth).clamp(0.50, 1.0);
       if ((nextW - _widthRatio).abs() >= 0.01) {
         _widthRatio = nextW;
         changed = true;
       }
     }
     if (screenRow >= geom.bodyRow + geom.bodyHeight) {
-      final nextH = (halfSpanH / geom.editorHeight).clamp(0.45, 0.96);
+      final nextH = (halfSpanH / geom.editorHeight).clamp(0.45, 1.0);
       if ((nextH - _heightRatio).abs() >= 0.01) {
         _heightRatio = nextH;
         changed = true;
@@ -728,31 +883,225 @@ class VisearchPicker {
       await openTargetDropdown();
     } else if (screenCol >= scopeStart && screenCol < targetStart) {
       await openScopeDropdown();
+    } else {
+      await _targetDropdown.close();
+      await _scopeDropdown.close();
     }
+  }
+
+  Future<int> _syncResultsCursorFromMouse(int rWin) async {
+    final maxLine = (_items.isEmpty ? 1 : _items.length).clamp(1, 999999);
+    try {
+      final mousePos = await nvim.getMousePos();
+      if (mousePos != null && mousePos.winId == rWin && mousePos.line >= 1) {
+        final targetLine = mousePos.line.clamp(1, maxLine);
+        await nvim.winSetCursor(rWin, targetLine, 0);
+        return targetLine;
+      }
+    } catch (_) {}
+    try {
+      final rawPos = await nvim.execLua('return vim.fn.getmousepos()');
+      if (rawPos is Map) {
+        final winId = (rawPos['winid'] as num?)?.toInt() ?? 0;
+        final line = (rawPos['line'] as num?)?.toInt() ?? 0;
+        if (winId == rWin && line >= 1) {
+          final targetLine = line.clamp(1, maxLine);
+          await nvim.winSetCursor(rWin, targetLine, 0);
+          return targetLine;
+        }
+      }
+    } catch (_) {}
+    final (row, _) = await nvim.winGetCursor(rWin);
+    return row;
   }
 
   /// Handles clicking or double-clicking a row in the Results window.
   Future<void> handleResultsClick({required bool openFile}) async {
+    await _targetDropdown.close();
+    await _scopeDropdown.close();
     final rWin = _resultsWin;
     if (rWin == null || !await nvim.winIsValid(rWin)) return;
-    final (row, _) = await nvim.winGetCursor(rWin);
+    final row = await _syncResultsCursorFromMouse(rWin);
     final idx = (row - 1).clamp(0, _items.isEmpty ? 0 : _items.length - 1);
+    final now = DateTime.now();
+
     if (_items.isNotEmpty) {
       _selectedIndex = idx;
       await _renderPreview();
       if (openFile) {
+        _lastClickTime = null;
+        _lastClickRow = null;
+        if (_lastDoubleClickTime != null &&
+            now.difference(_lastDoubleClickTime!) <=
+                const Duration(milliseconds: 250)) {
+          return;
+        }
+        _lastDoubleClickTime = now;
         await confirmSelection();
         return;
       }
+      if (_lastClickRow == row &&
+          _lastClickTime != null &&
+          now.difference(_lastClickTime!) <=
+              const Duration(milliseconds: 400)) {
+        _lastClickTime = null;
+        _lastClickRow = null;
+        _lastDoubleClickTime = now;
+        await confirmSelection();
+        return;
+      }
+      _lastClickRow = row;
+      _lastClickTime = now;
     }
     await _focusPrompt(startInsert: false);
   }
 
+  Future<bool> _isEligibleEditorWin(int? w) async {
+    if (w == null || w <= 0) return false;
+    if (w == _paddingWin ||
+        w == _promptWin ||
+        w == _resultsWin ||
+        w == _previewWin ||
+        _excludedWindows.contains(w)) {
+      return false;
+    }
+    try {
+      if (!await nvim.winIsValid(w)) return false;
+
+      final config = await nvim.winGetConfig(w);
+      final relative = config['relative']?.toString() ?? '';
+      if (relative.isNotEmpty) return false;
+
+      final buf = await nvim.winGetBuf(w);
+      if (buf > 0) {
+        final filetype =
+            (await nvim.bufGetOption(buf, 'filetype'))?.toString() ?? '';
+        if (_nonEditorFiletypes.contains(filetype)) return false;
+        final buftype =
+            (await nvim.bufGetOption(buf, 'buftype'))?.toString() ?? '';
+        if (buftype.isNotEmpty) return false;
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> _isReplaceableMainWin(int? w) async {
+    if (w == null || w <= 0) return false;
+    if (w == _paddingWin ||
+        w == _promptWin ||
+        w == _resultsWin ||
+        w == _previewWin ||
+        _excludedWindows.contains(w)) {
+      return false;
+    }
+    try {
+      if (!await nvim.winIsValid(w)) return false;
+
+      final config = await nvim.winGetConfig(w);
+      final relative = config['relative']?.toString() ?? '';
+      if (relative.isNotEmpty) return false;
+
+      final buf = await nvim.winGetBuf(w);
+      if (buf > 0) {
+        final filetype =
+            (await nvim.bufGetOption(buf, 'filetype'))?.toString() ?? '';
+        if (_nonEditorFiletypes.contains(filetype)) return false;
+        final buftype =
+            (await nvim.bufGetOption(buf, 'buftype'))?.toString() ?? '';
+        if (buftype == 'terminal' ||
+            buftype == 'quickfix' ||
+            buftype == 'prompt') {
+          return false;
+        }
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _rememberActiveEditorWin() async {
+    try {
+      final current = await nvim.getCurrentWin();
+      final alt = await nvim.getAlternateWin();
+      if (await _isEligibleEditorWin(current)) {
+        _lastActiveEditorWin = current;
+        _lastSeenAlternateWin = alt;
+        return;
+      }
+      if (await _isEligibleEditorWin(alt)) {
+        if (_lastActiveEditorWin == null ||
+            !await _isEligibleEditorWin(_lastActiveEditorWin) ||
+            (_lastSeenAlternateWin != null && alt != _lastSeenAlternateWin)) {
+          _lastActiveEditorWin = alt;
+        }
+        _lastSeenAlternateWin = alt;
+      }
+    } catch (_) {}
+  }
+
+  Future<int?> _resolveEditorWinFromCandidates(List<int?> candidates) async {
+    for (final c in candidates) {
+      if (await _isEligibleEditorWin(c)) {
+        return c;
+      }
+    }
+    List<int>? allWins;
+    try {
+      allWins = await nvim.listWins();
+      for (final w in allWins) {
+        if (await _isEligibleEditorWin(w)) {
+          return w;
+        }
+      }
+    } catch (_) {}
+    for (final c in candidates) {
+      if (await _isReplaceableMainWin(c)) {
+        return c;
+      }
+    }
+    if (allWins != null) {
+      for (final w in allWins) {
+        if (await _isReplaceableMainWin(w)) {
+          return w;
+        }
+      }
+    }
+    return null;
+  }
+
+  Future<int?> _resolveTargetEditorWin() async {
+    await _rememberActiveEditorWin();
+    return _resolveEditorWinFromCandidates(<int?>[
+      _originWin,
+      _lastActiveEditorWin,
+      await nvim.getAlternateWin(),
+      await nvim.getCurrentWin(),
+    ]);
+  }
+
   Future<void> _captureOriginContext() async {
     try {
-      _originWin = await nvim.getCurrentWin();
-      _originBuf = await nvim.getCurrentBuf();
-      if (_originBuf != null && await nvim.bufIsValid(_originBuf!)) {
+      await _rememberActiveEditorWin();
+      final resolvedWin = await _resolveEditorWinFromCandidates(<int?>[
+        await nvim.getCurrentWin(),
+        _lastActiveEditorWin,
+        await nvim.getAlternateWin(),
+        _originWin,
+      ]);
+      _originWin = resolvedWin ?? await nvim.getCurrentWin();
+      if (resolvedWin != null) {
+        _lastActiveEditorWin = resolvedWin;
+        final winBuf = await nvim.winGetBuf(resolvedWin);
+        _originBuf = winBuf > 0 ? winBuf : await nvim.getCurrentBuf();
+      } else {
+        _originBuf = await nvim.getCurrentBuf();
+      }
+      if (_originBuf != null &&
+          _originBuf! > 0 &&
+          await nvim.bufIsValid(_originBuf!)) {
         final name = await nvim.bufGetName(_originBuf!);
         _originBufPath = name.isEmpty ? null : name;
         _originBufLines = await nvim.bufGetLines(_originBuf!);
@@ -765,11 +1114,23 @@ class VisearchPicker {
     }
   }
 
+  static const String _promptPrefix = ' > ';
+
   Future<String> _readPromptQuery() async {
     final buf = _promptBuf;
-    if (buf == null || !await nvim.bufIsValid(buf)) return '';
-    final lines = await nvim.bufGetLines(buf, start: 0, end: 1);
-    return lines.isEmpty ? '' : lines.first;
+    if (buf == null) return '';
+    try {
+      if (!await nvim.bufIsValid(buf)) return '';
+      final lines = await nvim.bufGetLines(buf, start: 0, end: 1);
+      if (lines.isEmpty) return '';
+      final raw = lines.first;
+      if (raw.startsWith(_promptPrefix)) {
+        return raw.substring(_promptPrefix.length);
+      }
+      return raw;
+    } catch (_) {
+      return '';
+    }
   }
 
   Future<PickerGeometry> _computeCurrentGeometry() async {
@@ -783,6 +1144,20 @@ class VisearchPicker {
       splitRatio: _splitRatio,
       showPreview: _showPreview,
     );
+  }
+
+  Map<String, Object?> _paddingWinConfig(PickerGeometry geom) {
+    return {
+      'relative': 'editor',
+      'row': 0,
+      'col': 0,
+      'width': geom.editorWidth,
+      'height': geom.editorHeight,
+      'style': 'minimal',
+      'border': 'none',
+      'focusable': false,
+      'zindex': 90,
+    };
   }
 
   Map<String, Object?> _promptWinConfig(PickerGeometry geom) {
@@ -815,7 +1190,7 @@ class VisearchPicker {
       'title': ' Results (${_target.label}) ',
       'title_pos': 'center',
       'footer':
-          ' <Tab> target • <C-t> mode • <C-s> scope • <M-p> preview • q quit ',
+          ' <Tab> target • <C-t> mode • <C-s> scope • <C-y> copy path • <M-p> preview • q quit ',
       'footer_pos': 'center',
       'zindex': 100,
     };
@@ -848,6 +1223,7 @@ class VisearchPicker {
     _highlightsInitialized = true;
 
     const groups = <String, Map<String, Object?>>{
+      'VisearchPadding': {'link': 'NormalFloat'},
       'VisearchPillTarget': {'bold': true, 'link': 'DiagnosticInfo'},
       'VisearchPillScope': {'bold': true, 'link': 'Special'},
       'VisearchMatch': {'bold': true, 'link': 'IncSearch'},
@@ -865,15 +1241,31 @@ class VisearchPicker {
     final geom = await _computeCurrentGeometry();
     _lastGeometry = geom;
 
+    if (_paddingBuf == null || !await nvim.bufIsValid(_paddingBuf!)) {
+      final padBuf = await nvim.createBuf(listed: false, scratch: true);
+      _paddingBuf = padBuf;
+      await nvim.bufSetOption(padBuf, 'modifiable', false);
+      await nvim.bufSetOption(padBuf, 'buftype', 'nofile');
+      await nvim.bufSetOption(padBuf, 'bufhidden', 'wipe');
+      await nvim.bufSetOption(padBuf, 'swapfile', false);
+      await nvim.bufSetOption(padBuf, 'filetype', 'visearch-padding');
+    }
+
     if (_promptBuf == null || !await nvim.bufIsValid(_promptBuf!)) {
       final pBuf = await nvim.createBuf(listed: false, scratch: true);
       _promptBuf = pBuf;
       await nvim.bufSetOption(pBuf, 'modifiable', true);
-      await nvim.bufSetOption(pBuf, 'buftype', 'nofile');
+      await nvim.bufSetOption(pBuf, 'buftype', 'prompt');
       await nvim.bufSetOption(pBuf, 'bufhidden', 'wipe');
       await nvim.bufSetOption(pBuf, 'swapfile', false);
       await nvim.bufSetOption(pBuf, 'filetype', 'visearch-prompt');
-      await nvim.bufSetLines(pBuf, lines: [_query]);
+      try {
+        await nvim.execLua(
+          "local b, p = ...; vim.fn.prompt_setprompt(b, p)",
+          [pBuf, _promptPrefix],
+        );
+      } catch (_) {}
+      await nvim.bufSetLines(pBuf, lines: ['$_promptPrefix$_query']);
       await _bindPromptKeys(pBuf);
     }
 
@@ -895,7 +1287,20 @@ class VisearchPicker {
       await nvim.bufSetOption(prevBuf, 'buftype', 'nofile');
       await nvim.bufSetOption(prevBuf, 'bufhidden', 'wipe');
       await nvim.bufSetOption(prevBuf, 'swapfile', false);
+      await nvim.bufSetOption(prevBuf, 'filetype', 'visearch-preview');
       await _bindPreviewKeys(prevBuf);
+    }
+
+    if (_paddingWin == null || !await nvim.winIsValid(_paddingWin!)) {
+      _paddingWin = await nvim.openWin(
+        _paddingBuf!,
+        false,
+        _paddingWinConfig(geom),
+      );
+      await _configurePaddingWin(_paddingWin!);
+    } else {
+      await nvim.winSetConfig(_paddingWin!, _paddingWinConfig(geom));
+      await _configurePaddingWin(_paddingWin!);
     }
 
     if (_promptWin == null || !await nvim.winIsValid(_promptWin!)) {
@@ -936,12 +1341,21 @@ class VisearchPicker {
     await _attachAutocmds(_promptBuf!);
   }
 
+  Future<void> _configurePaddingWin(int win) async {
+    await nvim.winSetOption(win, 'winblend', 0);
+    await nvim.winSetOption(
+      win,
+      'winhighlight',
+      'Normal:VisearchPadding,NormalFloat:VisearchPadding,EndOfBuffer:VisearchPadding',
+    );
+  }
+
   Future<void> _configurePromptWin(int win) async {
     await nvim.winSetOption(win, 'number', false);
     await nvim.winSetOption(win, 'relativenumber', false);
     await nvim.winSetOption(win, 'signcolumn', 'no');
     await nvim.winSetOption(win, 'foldcolumn', '0');
-    await nvim.winSetOption(win, 'statuscolumn', '%#VisearchPillTarget# > %*');
+    await nvim.winSetOption(win, 'statuscolumn', '');
     await nvim.winSetOption(win, 'wrap', false);
     await nvim.winSetOption(win, 'cursorline', false);
   }
@@ -975,6 +1389,7 @@ class VisearchPicker {
       '<C-p>': 'search.prev_item',
       '<C-d>': 'search.preview_down',
       '<C-u>': 'search.preview_up',
+      '<C-y>': 'search.copy_path',
       '<M-p>': 'search.toggle_preview',
       '<CR>': 'search.confirm',
       '<LeftDrag>': 'search.mouse_drag',
@@ -991,12 +1406,20 @@ class VisearchPicker {
       }
     }
 
+    // Ensure any previous <Esc> bindings are cleared (e.g. on hot reload) so
+    // <Esc> enters Normal/command mode in the search prompt instead of closing.
+    try {
+      await nvim.execLua(
+        "local b = ...; pcall(vim.keymap.del, { 'i', 'n' }, '<Esc>', { buffer = b })",
+        [buf],
+      );
+    } catch (_) {}
+
     // Normal mode navigation & close
     const normalMappings = <String, String>{
       'j': 'search.next_item',
       'k': 'search.prev_item',
       'q': 'search.close',
-      '<Esc>': 'search.close',
       '<C-c>': 'search.close',
     };
     for (final entry in normalMappings.entries) {
@@ -1008,15 +1431,13 @@ class VisearchPicker {
       );
     }
 
-    // Insert mode <Esc> and <C-c> close the picker directly
-    for (final key in ['<Esc>', '<C-c>']) {
-      await nvim.bufSetKeymap(
-        buf,
-        'i',
-        key,
-        "<Esc><Cmd>lua require('$luaModule').action('search.close')<CR>",
-      );
-    }
+    // Insert mode <C-c> closes the picker directly; <Esc> leaves insert mode into normal mode
+    await nvim.bufSetKeymap(
+      buf,
+      'i',
+      '<C-c>',
+      "<Esc><Cmd>lua require('$luaModule').action('search.close')<CR>",
+    );
 
     // Mouse click on prompt pills
     for (final mode in ['n', 'i']) {
@@ -1044,10 +1465,11 @@ class VisearchPicker {
       '<C-g>': 'search.custom_glob',
       '<C-d>': 'search.preview_down',
       '<C-u>': 'search.preview_up',
+      '<C-y>': 'search.copy_path',
       '<M-p>': 'search.toggle_preview',
       '<CR>': 'search.confirm',
       'q': 'search.close',
-      '<Esc>': 'search.close',
+      '<Esc>': 'search.focus_prompt_normal',
       '<C-c>': 'search.close',
       '<LeftDrag>': 'search.mouse_drag',
     };
@@ -1076,7 +1498,7 @@ class VisearchPicker {
   Future<void> _bindPreviewKeys(int buf) async {
     const mappings = <String, String>{
       'q': 'search.close',
-      '<Esc>': 'search.close',
+      '<Esc>': 'search.focus_prompt_normal',
       '<C-c>': 'search.close',
       '<CR>': 'search.confirm',
       '<Tab>': 'search.target_next',
@@ -1084,6 +1506,7 @@ class VisearchPicker {
       '<C-t>': 'search.target_dropdown',
       '<C-s>': 'search.scope_dropdown',
       '<C-g>': 'search.custom_glob',
+      '<C-y>': 'search.copy_path',
       '<M-p>': 'search.toggle_preview',
       '<LeftDrag>': 'search.mouse_drag',
     };
@@ -1106,7 +1529,8 @@ vim.api.nvim_create_autocmd({ 'TextChangedI', 'TextChanged' }, {
   buffer = buf,
   callback = function()
     local lines = vim.api.nvim_buf_get_lines(buf, 0, 1, false)
-    local q = lines[1] or ''
+    local raw = lines[1] or ''
+    local q = raw:sub(1, 3) == ' > ' and raw:sub(4) or raw
     require('$luaModule').action('search.query_changed', q)
   end,
 })
@@ -1126,39 +1550,36 @@ vim.api.nvim_create_autocmd('VimResized', {
     final pWin = _promptWin;
     if (pWin == null || !await nvim.winIsValid(pWin)) return;
     await nvim.setCurrentWin(pWin);
-    await nvim.winSetCursor(pWin, 1, _query.length);
+    await nvim.winSetCursor(
+      pWin,
+      1,
+      _promptPrefix.length + _query.length,
+    );
     if (startInsert) {
       await nvim.command('startinsert!');
     }
   }
 
-  Future<void> _runSearch() async {
-    final gen = ++_searchGeneration;
-
-    List<SearchItem> found;
-    var totalScoped = 0;
-
+  Future<(List<SearchItem>, int)> _executeSearchProvider() async {
     switch (_target) {
       case SearchTarget.files:
-        final (items, total) = await filesProvider.search(
+        return filesProvider.search(
           workspaceRoot: _workspaceRoot,
           query: _query,
           scope: _scope,
           settings: _settings,
         );
-        found = items;
-        totalScoped = total;
       case SearchTarget.text:
-        found = await textProvider.search(
+        final found = await textProvider.search(
           workspaceRoot: _workspaceRoot,
           query: _query,
           scope: _scope,
           settings: _settings,
           currentBufferLines: _originBufLines,
         );
-        totalScoped = found.length;
+        return (found, found.length);
       case SearchTarget.symbols:
-        found = await symbolsProvider.search(
+        final found = await symbolsProvider.search(
           nvim: nvim,
           workspaceRoot: _workspaceRoot,
           query: _query,
@@ -1166,8 +1587,14 @@ vim.api.nvim_create_autocmd('VimResized', {
           originBuf: _originBuf,
           settings: _settings,
         );
-        totalScoped = found.length;
+        return (found, found.length);
     }
+  }
+
+  Future<void> _runSearch() async {
+    final gen = ++_searchGeneration;
+
+    final (found, totalScoped) = await _executeSearchProvider();
 
     if (gen != _searchGeneration) return;
     if (!await isOpen()) return;
@@ -1187,147 +1614,162 @@ vim.api.nvim_create_autocmd('VimResized', {
     final pBuf = _promptBuf;
     final pWin = _promptWin;
     final nsId = _nsId;
-    if (pBuf == null ||
-        nsId == null ||
-        !await nvim.bufIsValid(pBuf)) {
+    if (pBuf == null || nsId == null) {
       return;
     }
 
-    await nvim.bufClearNamespace(pBuf, nsId);
-    await nvim.bufSetExtmark(pBuf, nsId, 0, 0, {
-      'virt_text': [
-        [' [ 󰉋 Scope: ${_scope.label} ▾ ] ', 'VisearchPillScope'],
-        [' ', 'Normal'],
-        [' [ ${_target.icon} ${_target.label} ▾ ] ', 'VisearchPillTarget'],
-      ],
-      'virt_text_pos': 'right_align',
-    });
+    try {
+      if (!await nvim.bufIsValid(pBuf)) return;
+      await nvim.bufClearNamespace(pBuf, nsId);
+      await nvim.bufSetExtmark(pBuf, nsId, 0, 0, {
+        'end_col': _promptPrefix.length,
+        'hl_group': 'VisearchPillTarget',
+      });
+      await nvim.bufSetExtmark(pBuf, nsId, 0, 0, {
+        'virt_text': [
+          [' [ 󰉋 Scope: ${_scope.label} ▾ ] ', 'VisearchPillScope'],
+          [' ', 'Normal'],
+          [' [ ${_target.icon} ${_target.label} ▾ ] ', 'VisearchPillTarget'],
+        ],
+        'virt_text_pos': 'right_align',
+      });
 
-    if (pWin != null && await nvim.winIsValid(pWin) && _lastGeometry != null) {
-      await nvim.winSetConfig(pWin, _promptWinConfig(_lastGeometry!));
-    }
+      if (pWin != null && await nvim.winIsValid(pWin) && _lastGeometry != null) {
+        await nvim.winSetConfig(pWin, _promptWinConfig(_lastGeometry!));
+      }
+    } catch (_) {}
   }
 
   Future<void> _renderResults() async {
     final rBuf = _resultsBuf;
     final rWin = _resultsWin;
     final nsId = _nsId;
-    if (rBuf == null || nsId == null || !await nvim.bufIsValid(rBuf)) return;
+    if (rBuf == null || nsId == null) return;
 
-    await nvim.bufSetOption(rBuf, 'modifiable', true);
-    await nvim.bufClearNamespace(rBuf, nsId);
+    try {
+      if (!await nvim.bufIsValid(rBuf)) return;
+      await nvim.bufSetOption(rBuf, 'modifiable', true);
+      await nvim.bufClearNamespace(rBuf, nsId);
 
-    if (_items.isEmpty) {
-      final emptyMsg = _target == SearchTarget.text && _query.trim().isEmpty
-          ? '  Type a search query to run ripgrep (rg)…'
-          : '  No matching ${_target.label.toLowerCase()} found in ${_scope.label}';
-      await nvim.bufSetLines(rBuf, lines: [emptyMsg]);
-      await nvim.bufSetOption(rBuf, 'modifiable', false);
-      await nvim.bufSetExtmark(rBuf, nsId, 0, 0, {
-        'end_col': utf8.encode(emptyMsg).length,
-        'hl_group': 'VisearchMuted',
-      });
-      if (rWin != null && await nvim.winIsValid(rWin) && _lastGeometry != null) {
-        await nvim.winSetConfig(rWin, _resultsWinConfig(_lastGeometry!));
+      if (_items.isEmpty) {
+        final emptyMsg = _target == SearchTarget.text && _query.trim().isEmpty
+            ? '  Type a search query to run ripgrep (rg)…'
+            : '  No matching ${_target.label.toLowerCase()} found in ${_scope.label}';
+        await nvim.bufSetLines(rBuf, lines: [emptyMsg]);
+        await nvim.bufSetOption(rBuf, 'modifiable', false);
+        await nvim.bufSetExtmark(rBuf, nsId, 0, 0, {
+          'end_col': utf8.encode(emptyMsg).length,
+          'hl_group': 'VisearchMuted',
+        });
+        if (rWin != null &&
+            await nvim.winIsValid(rWin) &&
+            _lastGeometry != null) {
+          await nvim.winSetConfig(rWin, _resultsWinConfig(_lastGeometry!));
+        }
+        return;
       }
-      return;
-    }
 
-    const rowPrefix = '  ';
-    final prefixBytes = utf8.encode(rowPrefix).length;
-    final lines = _items.map((item) => '$rowPrefix${item.title}').toList();
+      const rowPrefix = '  ';
+      final prefixBytes = utf8.encode(rowPrefix).length;
+      final lines = _items.map((item) => '$rowPrefix${item.title}').toList();
 
-    await nvim.bufSetLines(rBuf, lines: lines);
-    await nvim.bufSetOption(rBuf, 'modifiable', false);
+      await nvim.bufSetLines(rBuf, lines: lines);
+      await nvim.bufSetOption(rBuf, 'modifiable', false);
 
-    for (var i = 0; i < _items.length; i++) {
-      final item = _items[i];
-      // Highlight matched character indices
-      for (final charIdx in item.matchIndices) {
-        if (charIdx >= 0 && charIdx < item.title.length) {
-          final byteStart =
-              prefixBytes + utf8.encode(item.title.substring(0, charIdx)).length;
-          final charByteLen =
-              utf8.encode(item.title.substring(charIdx, charIdx + 1)).length;
-          await nvim.bufSetExtmark(rBuf, nsId, i, byteStart, {
-            'end_col': byteStart + charByteLen,
-            'hl_group': 'VisearchMatch',
+      for (var i = 0; i < _items.length; i++) {
+        final item = _items[i];
+        // Highlight matched character indices
+        for (final charIdx in item.matchIndices) {
+          if (charIdx >= 0 && charIdx < item.title.length) {
+            final byteStart = prefixBytes +
+                utf8.encode(item.title.substring(0, charIdx)).length;
+            final charByteLen =
+                utf8.encode(item.title.substring(charIdx, charIdx + 1)).length;
+            await nvim.bufSetExtmark(rBuf, nsId, i, byteStart, {
+              'end_col': byteStart + charByteLen,
+              'hl_group': 'VisearchMatch',
+            });
+          }
+        }
+
+        if (item.badge != null && item.badge!.isNotEmpty) {
+          await nvim.bufSetExtmark(rBuf, nsId, i, 0, {
+            'virt_text': [
+              [' ${item.badge!} ', 'VisearchBadge'],
+            ],
+            'virt_text_pos': 'right_align',
           });
         }
       }
 
-      if (item.badge != null && item.badge!.isNotEmpty) {
-        await nvim.bufSetExtmark(rBuf, nsId, i, 0, {
-          'virt_text': [
-            [' ${item.badge!} ', 'VisearchBadge'],
-          ],
-          'virt_text_pos': 'right_align',
-        });
+      if (rWin != null && await nvim.winIsValid(rWin)) {
+        final targetRow = (_selectedIndex + 1).clamp(1, lines.length);
+        await nvim.winSetCursor(rWin, targetRow, 0);
+        if (_lastGeometry != null) {
+          await nvim.winSetConfig(rWin, _resultsWinConfig(_lastGeometry!));
+        }
       }
-    }
-
-    if (rWin != null && await nvim.winIsValid(rWin)) {
-      final targetRow = (_selectedIndex + 1).clamp(1, lines.length);
-      await nvim.winSetCursor(rWin, targetRow, 0);
-      if (_lastGeometry != null) {
-        await nvim.winSetConfig(rWin, _resultsWinConfig(_lastGeometry!));
-      }
-    }
+    } catch (_) {}
   }
 
   Future<void> _renderPreview() async {
     final prevBuf = _previewBuf;
     final prevWin = _previewWin;
     final nsId = _nsId;
-    if (prevBuf == null ||
-        prevWin == null ||
-        nsId == null ||
-        !await nvim.bufIsValid(prevBuf) ||
-        !await nvim.winIsValid(prevWin)) {
+    if (prevBuf == null || prevWin == null || nsId == null) {
       return;
     }
 
-    await nvim.bufClearNamespace(prevBuf, nsId);
-
-    if (_items.isEmpty || _selectedIndex >= _items.length) {
-      await nvim.bufSetOption(prevBuf, 'modifiable', true);
-      await nvim.bufSetLines(prevBuf, lines: const ['']);
-      await nvim.bufSetOption(prevBuf, 'modifiable', false);
-      if (_lastGeometry != null) {
-        await nvim.winSetConfig(prevWin, _previewWinConfig(_lastGeometry!));
-      }
-      return;
-    }
-
-    final item = _items[_selectedIndex];
-    List<String> fileLines;
     try {
-      final file = File(item.filePath);
-      if (await file.exists()) {
-        final raw = await file.readAsString();
-        fileLines = raw.split('\n');
-        if (fileLines.length > 800) {
-          fileLines = fileLines.sublist(0, 800);
+      if (!await nvim.bufIsValid(prevBuf) || !await nvim.winIsValid(prevWin)) {
+        return;
+      }
+
+      await nvim.bufClearNamespace(prevBuf, nsId);
+
+      if (_items.isEmpty || _selectedIndex >= _items.length) {
+        await nvim.bufSetOption(prevBuf, 'modifiable', true);
+        await nvim.bufSetLines(prevBuf, lines: const ['']);
+        await nvim.bufSetOption(prevBuf, 'modifiable', false);
+        if (_lastGeometry != null) {
+          await nvim.winSetConfig(prevWin, _previewWinConfig(_lastGeometry!));
         }
-      } else {
-        fileLines = const ['  [File not found on disk]'];
+        return;
       }
-    } catch (_) {
-      fileLines = const ['  [Binary or unreadable file]'];
-    }
 
-    if (fileLines.isEmpty) {
-      fileLines = const [''];
-    }
+      final item = _items[_selectedIndex];
+      List<String> fileLines;
+      try {
+        final file = File(item.filePath);
+        if (await file.exists()) {
+          final raw = await file.readAsString();
+          fileLines = raw.split('\n');
+          if (fileLines.length > 800) {
+            fileLines = fileLines.sublist(0, 800);
+          }
+        } else {
+          fileLines = const ['  [File not found on disk]'];
+        }
+      } catch (_) {
+        fileLines = const ['  [Binary or unreadable file]'];
+      }
 
-    await nvim.bufSetOption(prevBuf, 'modifiable', true);
-    await nvim.bufSetLines(prevBuf, lines: fileLines);
-    await nvim.bufSetOption(prevBuf, 'modifiable', false);
+      if (fileLines.isEmpty) {
+        fileLines = const [''];
+      }
 
-    // Apply Neovim filetype / Treesitter syntax highlighting
-    try {
-      await nvim.execLua(
-        r'''
+      if (!await nvim.bufIsValid(prevBuf) || !await nvim.winIsValid(prevWin)) {
+        return;
+      }
+
+      await nvim.bufSetOption(prevBuf, 'modifiable', true);
+      await nvim.bufSetLines(prevBuf, lines: fileLines);
+      await nvim.bufSetOption(prevBuf, 'modifiable', false);
+
+      // Apply Neovim filetype / Treesitter syntax highlighting
+      try {
+        await nvim.execLua(
+          r'''
 local buf, fname = ...
 if vim.api.nvim_buf_is_valid(buf) then
   local ft = vim.filetype.match({ filename = fname, buf = buf })
@@ -1337,28 +1779,29 @@ if vim.api.nvim_buf_is_valid(buf) then
   end
 end
 ''',
-        [prevBuf, item.filePath],
+          [prevBuf, item.filePath],
+        );
+      } catch (_) {}
+
+      final targetLine1Based = item.line.clamp(1, fileLines.length);
+      final lineIdx0 = targetLine1Based - 1;
+      final lineBytes = utf8.encode(fileLines[lineIdx0]).length;
+
+      await nvim.bufSetExtmark(prevBuf, nsId, lineIdx0, 0, {
+        'end_col': lineBytes,
+        'hl_group': 'VisearchPreviewTargetLine',
+        'hl_eol': true,
+      });
+
+      await nvim.winSetCursor(
+        prevWin,
+        targetLine1Based,
+        item.col.clamp(0, lineBytes),
       );
+
+      if (_lastGeometry != null) {
+        await nvim.winSetConfig(prevWin, _previewWinConfig(_lastGeometry!));
+      }
     } catch (_) {}
-
-    final targetLine1Based = item.line.clamp(1, fileLines.length);
-    final lineIdx0 = targetLine1Based - 1;
-    final lineBytes = utf8.encode(fileLines[lineIdx0]).length;
-
-    await nvim.bufSetExtmark(prevBuf, nsId, lineIdx0, 0, {
-      'end_col': lineBytes,
-      'hl_group': 'VisearchPreviewTargetLine',
-      'hl_eol': true,
-    });
-
-    await nvim.winSetCursor(
-      prevWin,
-      targetLine1Based,
-      item.col.clamp(0, lineBytes),
-    );
-
-    if (_lastGeometry != null) {
-      await nvim.winSetConfig(prevWin, _previewWinConfig(_lastGeometry!));
-    }
   }
 }

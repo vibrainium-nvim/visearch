@@ -97,27 +97,56 @@ class DropdownMenu<T> {
     await nvim.winSetOption(win, 'cursorline', true);
     await nvim.winSetOption(win, 'wrap', false);
     await nvim.winSetCursor(win, activeIndex + 1, 0);
+    await nvim.command('stopinsert');
 
-    await nvim.bufSetKeymap(
-      buf,
-      'n',
-      '<CR>',
-      "<Cmd>lua require('$luaModule').action('$actionPrefix.confirm')<CR>",
-    );
-    await nvim.bufSetKeymap(
-      buf,
-      'n',
-      '<LeftRelease>',
-      "<LeftMouse><Cmd>lua require('$luaModule').action('$actionPrefix.confirm')<CR>",
-    );
-    for (final cancelKey in ['q', '<Esc>']) {
+    for (final mode in ['n', 'i']) {
       await nvim.bufSetKeymap(
         buf,
-        'n',
-        cancelKey,
-        "<Cmd>lua require('$luaModule').action('$actionPrefix.cancel')<CR>",
+        mode,
+        '<CR>',
+        "<Cmd>lua require('$luaModule').action('$actionPrefix.confirm')<CR>",
       );
+      await nvim.bufSetKeymap(
+        buf,
+        mode,
+        '<LeftRelease>',
+        "<Cmd>lua local m = vim.fn.getmousepos(); if m.winid == $win then pcall(vim.api.nvim_win_set_cursor, $win, { math.max(1, m.line), 0 }); require('$luaModule').action('$actionPrefix.confirm') else require('$luaModule').action('$actionPrefix.cancel') end<CR>",
+      );
+      for (final cancelKey in ['<Esc>', '<C-c>']) {
+        await nvim.bufSetKeymap(
+          buf,
+          mode,
+          cancelKey,
+          "<Cmd>lua require('$luaModule').action('$actionPrefix.cancel')<CR>",
+        );
+      }
     }
+    await nvim.bufSetKeymap(
+      buf,
+      'n',
+      'q',
+      "<Cmd>lua require('$luaModule').action('$actionPrefix.cancel')<CR>",
+    );
+
+    try {
+      await nvim.execLua(
+        '''
+local buf = ...
+local grp = vim.api.nvim_create_augroup('VisearchDropdown_$actionPrefix', { clear = true })
+vim.api.nvim_create_autocmd({ 'WinLeave', 'BufLeave' }, {
+  group = grp,
+  buffer = buf,
+  once = true,
+  callback = function()
+    vim.schedule(function()
+      require('$luaModule').action('$actionPrefix.cancel')
+    end)
+  end,
+})
+''',
+        [buf],
+      );
+    } catch (_) {}
   }
 
   Future<void> confirm() async {
@@ -137,17 +166,31 @@ class DropdownMenu<T> {
   }
 
   Future<void> cancel() async {
+    final win = _win;
+    if (win == null) return;
     final callback = _onCancel;
+    var wasFocused = false;
+    try {
+      wasFocused = (await nvim.getCurrentWin()) == win;
+    } catch (_) {}
     await close();
-    if (callback != null) {
+    if (wasFocused && callback != null) {
       await callback();
     }
   }
 
   Future<void> close() async {
     final win = _win;
+    final buf = _buf;
     _win = null;
     _buf = null;
+    if (buf != null) {
+      try {
+        await nvim.execLua(
+          "pcall(vim.api.nvim_del_augroup_by_name, 'VisearchDropdown_$actionPrefix')",
+        );
+      } catch (_) {}
+    }
     if (win != null) {
       try {
         if (await nvim.winIsValid(win)) {
@@ -229,20 +272,42 @@ class GlobInputPrompt {
       '<CR>',
       "<Esc><Cmd>lua require('$luaModule').action('search.glob_submit')<CR>",
     );
-    for (final key in ['q', '<Esc>']) {
-      await nvim.bufSetKeymap(
-        buf,
-        'n',
-        key,
-        "<Cmd>lua require('$luaModule').action('search.glob_cancel')<CR>",
-      );
-    }
     await nvim.bufSetKeymap(
       buf,
-      'i',
-      '<Esc>',
-      "<Esc><Cmd>lua require('$luaModule').action('search.glob_cancel')<CR>",
+      'n',
+      'q',
+      "<Cmd>lua require('$luaModule').action('search.glob_cancel')<CR>",
     );
+    for (final mode in ['n', 'i']) {
+      await nvim.bufSetKeymap(
+        buf,
+        mode,
+        '<C-c>',
+        mode == 'i'
+            ? "<Esc><Cmd>lua require('$luaModule').action('search.glob_cancel')<CR>"
+            : "<Cmd>lua require('$luaModule').action('search.glob_cancel')<CR>",
+      );
+    }
+
+    try {
+      await nvim.execLua(
+        '''
+local buf = ...
+local grp = vim.api.nvim_create_augroup('VisearchGlobPrompt', { clear = true })
+vim.api.nvim_create_autocmd({ 'WinLeave', 'BufLeave' }, {
+  group = grp,
+  buffer = buf,
+  once = true,
+  callback = function()
+    vim.schedule(function()
+      require('$luaModule').action('search.glob_cancel')
+    end)
+  end,
+})
+''',
+        [buf],
+      );
+    } catch (_) {}
 
     await nvim.command('startinsert!');
   }
@@ -263,17 +328,31 @@ class GlobInputPrompt {
   }
 
   Future<void> cancel() async {
+    final win = _win;
+    if (win == null) return;
     final callback = _onCancel;
+    var wasFocused = false;
+    try {
+      wasFocused = (await nvim.getCurrentWin()) == win;
+    } catch (_) {}
     await close();
-    if (callback != null) {
+    if (wasFocused && callback != null) {
       await callback();
     }
   }
 
   Future<void> close() async {
     final win = _win;
+    final buf = _buf;
     _win = null;
     _buf = null;
+    if (buf != null) {
+      try {
+        await nvim.execLua(
+          "pcall(vim.api.nvim_del_augroup_by_name, 'VisearchGlobPrompt')",
+        );
+      } catch (_) {}
+    }
     if (win != null) {
       try {
         if (await nvim.winIsValid(win)) {

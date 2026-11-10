@@ -120,7 +120,7 @@ void main() {
         if (method == 'nvim_exec_lua') {
           return [
             {
-              'name': 'ViffSidebar',
+              'name': 'VivcsSidebar',
               'kind': 'Class',
               'file': '/ws/vivcs/lib/src/ui/sidebar.dart',
               'line': 10,
