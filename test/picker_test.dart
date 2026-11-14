@@ -678,5 +678,84 @@ void main() {
         isTrue,
       );
     });
+
+    test('scope dropdown includes separator and toggles workspace-excluded files', () async {
+      final settingsDir = Directory('${tempWs.path}/.vibrainium');
+      await settingsDir.create(recursive: true);
+      await File('${settingsDir.path}/settings.json').writeAsString(
+        '{"workspace.exclude": ["nvim/"]}',
+      );
+
+      await picker.handleAction('search.files');
+      expect(picker.includeExcluded, isFalse);
+
+      final resBuf = bufferLines.keys.firstWhere(
+        (b) => bufOptions[b]?['filetype'] == 'visearch-results',
+      );
+      expect(
+        bufferLines[resBuf]!.any((l) => l.contains('nvim/lib/b.dart')),
+        isFalse,
+      );
+      expect(
+        bufferLines[resBuf]!.any((l) => l.contains('vivcs/lib/a.dart')),
+        isTrue,
+      );
+
+      // <M-e> is bound in prompt, results, and preview buffers
+      expect(
+        keymaps.values.where((rhs) => rhs.contains('search.toggle_excluded')).length,
+        greaterThanOrEqualTo(3),
+      );
+
+      // Open Scope dropdown and verify separator + unchecked toggle item
+      await picker.handleAction('search.scope_dropdown');
+      final ddBuf = bufferLines.keys.firstWhere(
+        (b) => bufOptions[b]?['filetype'] == 'visearch-dropdown',
+      );
+      final ddWin = winBufs.entries.firstWhere((e) => e.value == ddBuf).key;
+      final ddLines = bufferLines[ddBuf]!;
+      final sepIdx = ddLines.indexWhere((l) => l.startsWith('───'));
+      expect(sepIdx, greaterThan(0));
+      final toggleIdx = ddLines.indexWhere(
+        (l) => l.contains('[ ] Include Workspace Excluded (<M-e>)'),
+      );
+      expect(toggleIdx, equals(sepIdx + 1));
+
+      // Confirming on the separator row is a no-op (dropdown remains open)
+      cursors[ddWin] = (sepIdx + 1, 0);
+      await picker.handleAction('search.scope_dropdown.confirm');
+      expect(validWins.contains(ddWin), isTrue);
+      expect(picker.includeExcluded, isFalse);
+
+      // Selecting the toggle row enables includeExcluded and shows excluded files
+      cursors[ddWin] = (toggleIdx + 1, 0);
+      await picker.handleAction('search.scope_dropdown.confirm');
+      expect(picker.includeExcluded, isTrue);
+      expect(
+        bufferLines[resBuf]!.any((l) => l.contains('nvim/lib/b.dart')),
+        isTrue,
+      );
+
+      // Re-opening Scope dropdown shows checked [✓] state
+      await picker.handleAction('search.scope_dropdown');
+      final ddBuf2 = bufferLines.keys.lastWhere(
+        (b) => bufOptions[b]?['filetype'] == 'visearch-dropdown',
+      );
+      expect(
+        bufferLines[ddBuf2]!.any(
+          (l) => l.contains('[✓] Include Workspace Excluded (<M-e>)'),
+        ),
+        isTrue,
+      );
+      await picker.handleAction('search.scope_dropdown.cancel');
+
+      // Direct search.toggle_excluded action toggles excluded files back off
+      await picker.handleAction('search.toggle_excluded');
+      expect(picker.includeExcluded, isFalse);
+      expect(
+        bufferLines[resBuf]!.any((l) => l.contains('nvim/lib/b.dart')),
+        isFalse,
+      );
+    });
   });
 }

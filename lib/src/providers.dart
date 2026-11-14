@@ -70,11 +70,15 @@ class FilesProvider {
 
   FilesProvider({this.runProcess = _defaultProcessRunner});
 
+  String _cacheKey(String workspaceRoot, bool includeIgnored) =>
+      '$workspaceRoot\u0000$includeIgnored';
+
   void clearCache([String? workspaceRoot]) {
     if (workspaceRoot == null) {
       _cache.clear();
     } else {
-      _cache.remove(workspaceRoot);
+      _cache.remove(_cacheKey(workspaceRoot, false));
+      _cache.remove(_cacheKey(workspaceRoot, true));
     }
   }
 
@@ -82,24 +86,27 @@ class FilesProvider {
   Future<List<String>> listWorkspaceFiles(
     String workspaceRoot, {
     bool forceRefresh = false,
+    bool includeIgnored = false,
   }) async {
-    if (!forceRefresh && _cache.containsKey(workspaceRoot)) {
-      return _cache[workspaceRoot]!;
+    final key = _cacheKey(workspaceRoot, includeIgnored);
+    if (!forceRefresh && _cache.containsKey(key)) {
+      return _cache[key]!;
     }
 
     try {
+      final args = <String>[
+        '--files',
+        '--hidden',
+        if (includeIgnored) '--no-ignore',
+        '-g',
+        '!.git',
+        '-g',
+        '!.svn',
+        if (!includeIgnored) ...['-g', '!.dart_tool'],
+      ];
       final res = await runProcess(
         'rg',
-        const [
-          '--files',
-          '--hidden',
-          '-g',
-          '!.git',
-          '-g',
-          '!.svn',
-          '-g',
-          '!.dart_tool',
-        ],
+        args,
         workingDirectory: workspaceRoot,
       );
       if (res.exitCode != 0 && (res.stdout as String).trim().isEmpty) {
@@ -112,8 +119,8 @@ class FilesProvider {
           .map((line) => line.startsWith('./') ? line.substring(2) : line)
           .toList()
         ..sort();
-      _cache[workspaceRoot] = List.unmodifiable(files);
-      return _cache[workspaceRoot]!;
+      _cache[key] = List.unmodifiable(files);
+      return _cache[key]!;
     } catch (_) {
       return const [];
     }
@@ -125,6 +132,7 @@ class FilesProvider {
     required String query,
     required SearchScope scope,
     VibrainiumSettings settings = const VibrainiumSettings(),
+    bool includeIgnored = false,
     int maxResults = 250,
   }) async {
     List<String> candidates;
@@ -136,7 +144,10 @@ class FilesProvider {
       final rel = SearchScope.toRelativePath(workspaceRoot, bufPath);
       candidates = rel.isEmpty ? const [] : [rel];
     } else {
-      final allFiles = await listWorkspaceFiles(workspaceRoot);
+      final allFiles = await listWorkspaceFiles(
+        workspaceRoot,
+        includeIgnored: includeIgnored,
+      );
       candidates = allFiles
           .where(
             (rel) => scope.matchesPath(
@@ -201,6 +212,7 @@ class TextProvider {
     required String query,
     required SearchScope scope,
     VibrainiumSettings settings = const VibrainiumSettings(),
+    bool includeIgnored = false,
     List<String>? currentBufferLines,
     int maxResults = 200,
   }) async {
@@ -253,6 +265,7 @@ class TextProvider {
       '--vimgrep',
       '--smart-case',
       '--hidden',
+      if (includeIgnored) '--no-ignore',
       '--max-columns',
       '240',
       '--max- columns-preview'.replaceAll(' ', ''),
@@ -260,8 +273,7 @@ class TextProvider {
       '!.git',
       '-g',
       '!.svn',
-      '-g',
-      '!.dart_tool',
+      if (!includeIgnored) ...['-g', '!.dart_tool'],
       ...scope.buildRgArgs(settings: settings),
       '--',
       trimmed,

@@ -3,14 +3,24 @@ import 'package:nvim/nvim.dart';
 /// Item in a floating dropdown menu.
 class DropdownItem<T> {
   final String label;
-  final T value;
+  final T? value;
   final bool isActive;
+  final bool isSeparator;
+  final bool isToggle;
 
   const DropdownItem({
     required this.label,
-    required this.value,
+    required T this.value,
     this.isActive = false,
-  });
+    this.isToggle = false,
+  }) : isSeparator = false;
+
+  const DropdownItem.separator()
+    : label = '',
+      value = null,
+      isActive = false,
+      isSeparator = true,
+      isToggle = false;
 }
 
 /// Reusable floating dropdown menu anchored near the search prompt header.
@@ -54,20 +64,36 @@ class DropdownMenu<T> {
     _buf = buf;
 
     final lines = <String>[];
+    final separatorIndices = <int>[];
     var maxWidth = title.length + 4;
     var activeIndex = 0;
+    var foundActive = false;
 
     for (var i = 0; i < items.length; i++) {
       final item = items[i];
-      if (item.isActive) {
-        activeIndex = i;
+      if (item.isSeparator) {
+        separatorIndices.add(i);
+        lines.add('');
+        continue;
       }
-      final prefix = item.isActive ? ' ● ' : '   ';
+      if (!foundActive && item.isActive && !item.isToggle) {
+        activeIndex = i;
+        foundActive = true;
+      }
+      final prefix = item.isToggle
+          ? (item.isActive ? ' [✓] ' : ' [ ] ')
+          : (item.isActive ? ' ● ' : '   ');
       final line = '$prefix${item.label} ';
       lines.add(line);
       if (line.runes.length > maxWidth) {
         maxWidth = line.runes.length;
       }
+    }
+
+    final width = maxWidth.clamp(20, 56);
+    final height = lines.length.clamp(1, 14);
+    for (final sepIdx in separatorIndices) {
+      lines[sepIdx] = '─' * width;
     }
 
     await nvim.bufSetOption(buf, 'modifiable', true);
@@ -77,8 +103,17 @@ class DropdownMenu<T> {
     await nvim.bufSetOption(buf, 'bufhidden', 'wipe');
     await nvim.bufSetOption(buf, 'filetype', 'visearch-dropdown');
 
-    final width = maxWidth.clamp(20, 56);
-    final height = lines.length.clamp(1, 14);
+    if (separatorIndices.isNotEmpty) {
+      try {
+        final nsId = await nvim.createNamespace('visearch_dropdown');
+        for (final sepIdx in separatorIndices) {
+          await nvim.bufSetExtmark(buf, nsId, sepIdx, 0, {
+            'end_row': sepIdx + 1,
+            'hl_group': 'FloatBorder',
+          });
+        }
+      } catch (_) {}
+    }
 
     final win = await nvim.openWin(buf, true, {
       'relative': 'editor',
@@ -128,6 +163,19 @@ class DropdownMenu<T> {
       "<Cmd>lua require('$luaModule').action('$actionPrefix.cancel')<CR>",
     );
 
+    if (separatorIndices.isNotEmpty) {
+      final sepSetLua = separatorIndices.map((i) => '[${i + 1}] = true').join(', ');
+      final totalLines = lines.length;
+      String stepLua(int delta) =>
+          "<Cmd>lua local sep = {$sepSetLua}; local r = vim.api.nvim_win_get_cursor($win)[1] + ($delta); while r >= 1 and r <= $totalLines and sep[r] do r = r + ($delta) end; if r >= 1 and r <= $totalLines and not sep[r] then pcall(vim.api.nvim_win_set_cursor, $win, { r, 0 }) end<CR>";
+      for (final downKey in ['j', '<Down>']) {
+        await nvim.bufSetKeymap(buf, 'n', downKey, stepLua(1));
+      }
+      for (final upKey in ['k', '<Up>']) {
+        await nvim.bufSetKeymap(buf, 'n', upKey, stepLua(-1));
+      }
+    }
+
     try {
       await nvim.execLua(
         '''
@@ -158,10 +206,14 @@ vim.api.nvim_create_autocmd({ 'WinLeave', 'BufLeave' }, {
     final (row, _) = await nvim.winGetCursor(win);
     final idx = row - 1;
     final items = _items;
+    if (idx < 0 || idx >= items.length || items[idx].isSeparator) {
+      return;
+    }
+    final selected = items[idx].value;
     final callback = _onSelect;
     await close();
-    if (callback != null && idx >= 0 && idx < items.length) {
-      await callback(items[idx].value);
+    if (callback != null && selected is T) {
+      await callback(selected);
     }
   }
 

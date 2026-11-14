@@ -9,6 +9,7 @@ import 'providers.dart';
 import 'scope.dart';
 
 const String _customGlobSentinel = '__CUSTOM_GLOB__';
+const String _toggleExcludedSentinel = '__TOGGLE_EXCLUDED__';
 
 /// Computed geometry for the 3-pane `VisearchPicker` layout.
 class PickerGeometry {
@@ -190,8 +191,15 @@ class VisearchPicker {
 
   String _workspaceRoot = '';
   VibrainiumSettings _settings = const VibrainiumSettings();
+  bool _includeExcluded = false;
   List<String> _subprojects = const [];
   final List<String> _recentCustomGlobs = [];
+
+  bool get includeExcluded => _includeExcluded;
+
+  VibrainiumSettings get _effectiveSettings => _includeExcluded
+      ? VibrainiumSettings(diffMode: _settings.diffMode)
+      : _settings;
 
   SearchTarget _target = SearchTarget.files;
   SearchScope _scope = const SearchScope.workspace();
@@ -296,7 +304,7 @@ class VisearchPicker {
     _settings = await VibrainiumSettings.load(_workspaceRoot);
     _subprojects = await discoverSubprojects(
       Directory(_workspaceRoot),
-      settings: _settings,
+      settings: _effectiveSettings,
     );
 
     await _ensureHighlights();
@@ -445,6 +453,9 @@ class VisearchPicker {
       case 'search.toggle_preview':
         await togglePreview();
         return true;
+      case 'search.toggle_excluded':
+        await toggleExcluded();
+        return true;
       case 'search.preview_down':
         await scrollPreview(8);
         return true;
@@ -552,6 +563,20 @@ class VisearchPicker {
     await _renderPreview();
   }
 
+  /// Toggles whether `workspace.exclude` files are included in search results.
+  Future<void> toggleExcluded() async {
+    _includeExcluded = !_includeExcluded;
+    if (_workspaceRoot.isNotEmpty) {
+      _subprojects = await discoverSubprojects(
+        Directory(_workspaceRoot),
+        settings: _effectiveSettings,
+      );
+    }
+    if (await isOpen()) {
+      await _runSearch();
+    }
+  }
+
   /// Scrolls the Preview pane by [deltaLines] lines.
   Future<void> scrollPreview(int deltaLines) async {
     final prevWin = _previewWin;
@@ -653,6 +678,13 @@ class VisearchPicker {
         label: 'Edit Custom Path/Glob…',
         value: _customGlobSentinel,
       ),
+      const DropdownItem<Object>.separator(),
+      DropdownItem<Object>(
+        label: 'Include Workspace Excluded (<M-e>)',
+        value: _toggleExcludedSentinel,
+        isActive: _includeExcluded,
+        isToggle: true,
+      ),
     ];
 
     final dropdownCol =
@@ -667,6 +699,11 @@ class VisearchPicker {
       onSelect: (selected) async {
         if (selected == _customGlobSentinel) {
           await openCustomGlobPrompt();
+          return;
+        }
+        if (selected == _toggleExcludedSentinel) {
+          await toggleExcluded();
+          await _focusPrompt(startInsert: true);
           return;
         }
         if (selected is SearchScope) {
@@ -860,6 +897,11 @@ class VisearchPicker {
     }
   }
 
+  String get _targetPillText => ' [ ${_target.icon} ${_target.label} ▾ ] ';
+  String get _scopePillText => _includeExcluded
+      ? ' [ 󰉋 Scope: ${_scope.label} (+Excl) ▾ ] '
+      : ' [ 󰉋 Scope: ${_scope.label} ▾ ] ';
+
   /// Handles clicking on the right-aligned `[ Scope ▾ ]` or `[ Target ▾ ]` pills in the prompt.
   Future<void> handlePromptClick() async {
     if (!await isOpen()) return;
@@ -873,11 +915,11 @@ class VisearchPicker {
     if (rawPos is! Map) return;
     final screenCol = (rawPos['screencol'] as num?)?.toInt() ?? 0;
 
-    final targetPillText = ' [ ${_target.icon} ${_target.label} ▾ ] ';
-    final scopePillText = ' [ 󰉋 Scope: ${_scope.label} ▾ ] ';
+    final targetPillText = _targetPillText;
+    final scopePillText = _scopePillText;
     final rightEdge = geom.promptCol + geom.promptWidth;
     final targetStart = rightEdge - targetPillText.runes.length;
-    final scopeStart = targetStart - scopePillText.runes.length;
+    final scopeStart = targetStart - scopePillText.runes.length - 1;
 
     if (screenCol >= targetStart && screenCol <= rightEdge) {
       await openTargetDropdown();
@@ -1391,6 +1433,7 @@ class VisearchPicker {
       '<C-u>': 'search.preview_up',
       '<C-y>': 'search.copy_path',
       '<M-p>': 'search.toggle_preview',
+      '<M-e>': 'search.toggle_excluded',
       '<CR>': 'search.confirm',
       '<LeftDrag>': 'search.mouse_drag',
     };
@@ -1467,6 +1510,7 @@ class VisearchPicker {
       '<C-u>': 'search.preview_up',
       '<C-y>': 'search.copy_path',
       '<M-p>': 'search.toggle_preview',
+      '<M-e>': 'search.toggle_excluded',
       '<CR>': 'search.confirm',
       'q': 'search.close',
       '<Esc>': 'search.focus_prompt_normal',
@@ -1508,6 +1552,7 @@ class VisearchPicker {
       '<C-g>': 'search.custom_glob',
       '<C-y>': 'search.copy_path',
       '<M-p>': 'search.toggle_preview',
+      '<M-e>': 'search.toggle_excluded',
       '<LeftDrag>': 'search.mouse_drag',
     };
     for (final entry in mappings.entries) {
@@ -1561,20 +1606,23 @@ vim.api.nvim_create_autocmd('VimResized', {
   }
 
   Future<(List<SearchItem>, int)> _executeSearchProvider() async {
+    final effectiveSettings = _effectiveSettings;
     switch (_target) {
       case SearchTarget.files:
         return filesProvider.search(
           workspaceRoot: _workspaceRoot,
           query: _query,
           scope: _scope,
-          settings: _settings,
+          settings: effectiveSettings,
+          includeIgnored: _includeExcluded,
         );
       case SearchTarget.text:
         final found = await textProvider.search(
           workspaceRoot: _workspaceRoot,
           query: _query,
           scope: _scope,
-          settings: _settings,
+          settings: effectiveSettings,
+          includeIgnored: _includeExcluded,
           currentBufferLines: _originBufLines,
         );
         return (found, found.length);
@@ -1585,7 +1633,7 @@ vim.api.nvim_create_autocmd('VimResized', {
           query: _query,
           scope: _scope,
           originBuf: _originBuf,
-          settings: _settings,
+          settings: effectiveSettings,
         );
         return (found, found.length);
     }
@@ -1627,9 +1675,9 @@ vim.api.nvim_create_autocmd('VimResized', {
       });
       await nvim.bufSetExtmark(pBuf, nsId, 0, 0, {
         'virt_text': [
-          [' [ 󰉋 Scope: ${_scope.label} ▾ ] ', 'VisearchPillScope'],
+          [_scopePillText, 'VisearchPillScope'],
           [' ', 'Normal'],
-          [' [ ${_target.icon} ${_target.label} ▾ ] ', 'VisearchPillTarget'],
+          [_targetPillText, 'VisearchPillTarget'],
         ],
         'virt_text_pos': 'right_align',
       });

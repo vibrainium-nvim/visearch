@@ -45,6 +45,46 @@ void main() {
       expect(subItems, hasLength(1));
       expect(subItems.first.relativePath, 'vivcs/test/sidebar_test.dart');
     });
+
+    test('passes --no-ignore when includeIgnored is true and caches separately', () async {
+      final capturedArgs = <List<String>>[];
+      final provider = FilesProvider(
+        runProcess: (exe, args, {workingDirectory}) async {
+          capturedArgs.add(args);
+          final noIgnore = args.contains('--no-ignore');
+          return ProcessResult(
+            1,
+            0,
+            noIgnore
+                ? 'lib/a.dart\nbuild/out.dart\n'
+                : 'lib/a.dart\n',
+            '',
+          );
+        },
+      );
+
+      final (normalItems, _) = await provider.search(
+        workspaceRoot: '/ws',
+        query: '',
+        scope: const SearchScope.workspace(),
+        includeIgnored: false,
+      );
+      expect(normalItems.map((e) => e.relativePath), ['lib/a.dart']);
+      expect(capturedArgs.last, isNot(contains('--no-ignore')));
+
+      final (ignoredItems, _) = await provider.search(
+        workspaceRoot: '/ws',
+        query: '',
+        scope: const SearchScope.workspace(),
+        includeIgnored: true,
+      );
+      expect(
+        ignoredItems.map((e) => e.relativePath),
+        ['build/out.dart', 'lib/a.dart'],
+      );
+      expect(capturedArgs.last, contains('--no-ignore'));
+      expect(capturedArgs, hasLength(2));
+    });
   });
 
   group('TextProvider', () {
